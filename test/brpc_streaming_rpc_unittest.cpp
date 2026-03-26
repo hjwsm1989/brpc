@@ -21,12 +21,14 @@
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <errno.h>
 #include "brpc/server.h"
 
 #include "brpc/controller.h"
 #include "brpc/channel.h"
 #include "brpc/callback.h"
 #include "brpc/socket.h"
+#include "brpc/details/controller_private_accessor.h"
 #include "brpc/stream_impl.h"
 #include "brpc/policy/streaming_rpc_protocol.h"
 #include "echo.pb.h"
@@ -220,6 +222,30 @@ private:
     BatchStreamFeedbackRaceState* _state;
 };
 
+
+class MyServiceWithStreamAndFailedSocket : public test::EchoService {
+public:
+    explicit MyServiceWithStreamAndFailedSocket(const brpc::StreamOptions& options)
+        : _options(options) {}
+
+    void Echo(::google::protobuf::RpcController* controller,
+              const ::test::EchoRequest* request,
+              ::test::EchoResponse* response,
+              ::google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        response->set_message(request->message());
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(controller);
+        brpc::StreamId response_stream;
+        ASSERT_EQ(0, StreamAccept(&response_stream, *cntl, &_options));
+        brpc::ControllerPrivateAccessor accessor(cntl);
+        ASSERT_TRUE(accessor.get_sending_socket() != NULL);
+        accessor.get_sending_socket()->SetFailed();
+    }
+
+private:
+    brpc::StreamOptions _options;
+};
+
 static void SetAtomicTrue(std::atomic<bool>* f) {
     f->store(true, std::memory_order_release);
 }
@@ -230,6 +256,30 @@ static bool WaitForTrue(const std::atomic<bool>& f, int timeout_ms) {
         usleep(1000);
     }
     return f.load(std::memory_order_acquire);
+}
+
+
+TEST_F(StreamingRpcTest, set_host_socket_returns_error_when_socket_is_failed) {
+    brpc::SocketOptions socket_options;
+    brpc::SocketId host_socket_id;
+    ASSERT_EQ(0, brpc::Socket::Create(socket_options, &host_socket_id));
+    brpc::SocketUniquePtr host_socket;
+    ASSERT_EQ(0, brpc::Socket::Address(host_socket_id, &host_socket));
+    ASSERT_EQ(0, host_socket->SetFailed());
+
+    brpc::StreamId stream_id;
+    brpc::StreamOptions stream_options;
+    ASSERT_EQ(0, brpc::Stream::Create(stream_options, NULL, &stream_id, false));
+    brpc::ScopedStream stream_guard(stream_id);
+
+    brpc::SocketUniquePtr stream_socket;
+    ASSERT_EQ(0, brpc::Socket::Address(stream_id, &stream_socket));
+    brpc::Stream* stream = static_cast<brpc::Stream*>(stream_socket->conn());
+
+    errno = 0;
+    ASSERT_EQ(-1, stream->SetHostSocket(host_socket.get()));
+    ASSERT_NE(0, errno);
+    ASSERT_TRUE(stream->_host_socket == NULL);
 }
 
 TEST_F(StreamingRpcTest, sanity) {
@@ -392,6 +442,40 @@ private:
     int _idle_times;
     HandlerControl* _cntl;
 };
+
+
+TEST_F(StreamingRpcTest, server_failed_socket_before_response_closes_stream_without_abort) {
+    OrderedInputHandler handler;
+    brpc::StreamOptions response_stream_options;
+    response_stream_options.handler = &handler;
+    brpc::Server server;
+    MyServiceWithStreamAndFailedSocket service(response_stream_options);
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9007, NULL));
+
+    brpc::Channel channel;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9007", NULL));
+    brpc::Controller cntl;
+    brpc::StreamId request_stream;
+    ASSERT_EQ(0, StreamCreate(&request_stream, cntl, NULL));
+    brpc::ScopedStream stream_guard(request_stream);
+
+    test::EchoService_Stub stub(&channel);
+    stub.Echo(&cntl, &request, &response, NULL);
+    ASSERT_TRUE(cntl.Failed());
+
+    for (int i = 0; i < 10000 && !handler.stopped(); ++i) {
+        usleep(100);
+    }
+
+    server.Stop(0);
+    server.Join();
+
+    ASSERT_TRUE(handler.stopped());
+    ASSERT_TRUE(handler.failed());
+    ASSERT_EQ(0, handler.idle_times());
+    ASSERT_EQ(0, handler._expected_next_value);
+}
 
 TEST_F(StreamingRpcTest, received_in_order) {
     OrderedInputHandler handler;
